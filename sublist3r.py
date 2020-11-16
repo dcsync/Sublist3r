@@ -15,11 +15,13 @@ import multiprocessing
 import threading
 import socket
 import json
+import collections
 from collections import Counter
 
 # external modules
 from subbrute import subbrute
 import dns.resolver
+import dns.reversename
 import requests
 
 # Python 2.x and 3.x compatiablity
@@ -42,30 +44,36 @@ except:
 is_windows = sys.platform.startswith('win')
 
 # Console Colors
-if is_windows:
-    # Windows deserves coloring too :D
-    G = '\033[92m'  # green
-    Y = '\033[93m'  # yellow
-    B = '\033[94m'  # blue
-    R = '\033[91m'  # red
-    W = '\033[0m'   # white
-    try:
-        import win_unicode_console , colorama
-        win_unicode_console.enable()
-        colorama.init()
-        #Now the unicode will work ^_^
-    except:
-        print("[!] Error: Coloring libraries not installed, no coloring will be used [Check the readme]")
-        G = Y = B = R = W = G = Y = B = R = W = ''
+if sys.stdout.isatty():
+    if is_windows:
+        # Windows deserves coloring too :D
+        G = '\033[92m'  # green
+        Y = '\033[93m'  # yellow
+        B = '\033[94m'  # blue
+        R = '\033[91m'  # red
+        W = '\033[0m'   # white
+        try:
+            import win_unicode_console , colorama
+            win_unicode_console.enable()
+            colorama.init()
+            #Now the unicode will work ^_^
+        except:
+            print("[!] Error: Coloring libraries not installed, no coloring will be used [Check the readme]")
+            G = Y = B = R = W = G = Y = B = R = W = ''
 
 
+    else:
+        G = '\033[92m'  # green
+        Y = '\033[93m'  # yellow
+        B = '\033[94m'  # blue
+        R = '\033[91m'  # red
+        W = '\033[0m'   # white
 else:
-    G = '\033[92m'  # green
-    Y = '\033[93m'  # yellow
-    B = '\033[94m'  # blue
-    R = '\033[91m'  # red
-    W = '\033[0m'   # white
-
+    G = ''  # green
+    Y = ''  # yellow
+    B = ''  # blue
+    R = ''  # red
+    W = ''  # white
 
 def banner():
     print("""%s
@@ -97,6 +105,7 @@ def parse_args():
     parser.add_argument('-v', '--verbose', help='Enable Verbosity and display results in realtime', nargs='?', default=False)
     parser.add_argument('-t', '--threads', help='Number of threads to use for subbrute bruteforce', type=int, default=30)
     parser.add_argument('-e', '--engines', help='Specify a comma-separated list of search engines')
+    parser.add_argument('-r', '--ranges', action='store_true', help='Identify IP ranges')
     parser.add_argument('-o', '--output', help='Save the results to text file')
     return parser.parse_args()
 
@@ -861,8 +870,84 @@ class portscan():
             t = threading.Thread(target=self.port_scan, args=(subdomain, self.ports))
             t.start()
 
+def recurse_rdns(subdomains):
+    finished_subdomains = set()
+    finished_ips = set()
+    pending_subdomains = set(subdomains)
+    pending_ips = set()
 
-def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, engines):
+    while pending_ips or pending_subdomains:
+        for subdomain in pending_subdomains:
+            #print('resolving ' + subdomain)
+            # handle pending subdomains
+            try:
+                new_ips = set([str(a) for a in dns.resolver.query(subdomain, 'A')])
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                #print('not found: ' + subdomain)
+                continue
+
+            for ip in new_ips:
+                if ip not in finished_ips:
+                    pending_ips.add(ip)
+
+        finished_subdomains |= pending_subdomains
+        pending_subdomains = set()
+
+        for ip in pending_ips:
+            #print('resolving ' + ip)
+            # get rdns for address
+            rev = dns.reversename.from_address(ip)
+            try:
+                subdomain = str(dns.resolver.query(rev, 'PTR')[0]).rstrip('.')
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+                #print('not found: ' + ip)
+                continue
+
+            if subdomain not in finished_subdomains:
+                pending_subdomains.add(subdomain)
+
+        finished_ips |= pending_ips
+        pending_ips = set()
+
+    #print('finished')
+    return finished_subdomains, finished_ips
+
+def get_ips(subdomains):
+    ips = {}
+
+    for subdomain in subdomains:
+        try:
+            new_ips = set([str(a) for a in dns.resolver.query(subdomain, 'A')])
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            continue
+
+        ips[subdomain] = new_ips
+
+    return ips
+
+def get_ranges(subdomains):
+    import ipwhois
+
+    ranges = collections.defaultdict(list)
+    ips = get_ips(subdomains)
+
+    for subdomain, subdomain_ips in ips.items():
+        for ip in subdomain_ips:
+            whois = ipwhois.IPWhois(ip)
+            result = whois.lookup_rdap()
+            #import pprint
+            #pprint.pprint(result)
+            item = {'ip': ip,
+                    'asn_cidr': result['asn_cidr'],
+                    'asn_description': result['asn_description'],
+                    'network_cidr': result['network']['cidr'],
+                    'network_name': result['network']['name']}
+            ranges[subdomain].append(item)
+
+    return ranges
+
+def main(domain, threads, savefile, ports, silent=False, verbose=False,
+        enable_bruteforce=False, enable_rdns=True, enable_ranges=False, engines=None):
     bruteforce_list = set()
     search_list = set()
 
@@ -945,6 +1030,17 @@ def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, e
 
     subdomains = search_list.union(bruteforce_list)
 
+    if enable_rdns:
+        if not silent:
+            print(G + "[-] Starting RDNS module now.." + W)
+
+        rdns_subdomains, rdns_ips = recurse_rdns(subdomains)
+        print(G + "[-] RDNS finds:" + W)
+        for domain in rdns_subdomains - subdomains:
+            print(G + ' - ' + domain + W)
+
+        subdomains |= rdns_subdomains
+
     if subdomains:
         subdomains = sorted(subdomains, key=subdomain_sorting_key)
 
@@ -964,6 +1060,41 @@ def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, e
         elif not silent:
             for subdomain in subdomains:
                 print(G + subdomain + W)
+
+    if enable_ranges:
+        print(G + "[-] Starting ranges module now.." + W)
+        ranges = get_ranges(subdomains)
+        by_cidr = {}
+        for subdomain, results in ranges.items():
+            for result in results:
+                asn_cidr = result['asn_cidr']
+                ip = result['ip']
+                if asn_cidr not in by_cidr:
+                    by_cidr[asn_cidr] = result
+                    by_cidr[asn_cidr]['hosts'] = []
+
+                by_cidr[asn_cidr]['hosts'].append((subdomain, ip))
+
+        for asn_cidr, result in by_cidr.items():
+            name = result['network_name']
+            cidr = result['network_cidr']
+            asn_desc = result['asn_description']
+            hosts = result['hosts']
+
+            print(G + '=== {} ==='.format(asn_cidr) + W)
+            print(G + 'ASN description: {}'.format(asn_desc) + W)
+            print(G + 'Network name: {}'.format(name) + W)
+            if cidr == asn_cidr:
+                note = ' (same as ASN)'
+            else:
+                note = ''
+            print(G + 'Network cidr: {}{}'.format(cidr, note) + W)
+
+            print(G + 'Hosts:' + W)
+            for subdomain, ip in hosts:
+                print(G + ' - {}\t{}'.format(subdomain, ip) + W)
+            print()
+
     return subdomains
 
 
@@ -976,10 +1107,13 @@ def interactive():
     enable_bruteforce = args.bruteforce
     verbose = args.verbose
     engines = args.engines
+    enable_ranges = args.ranges
     if verbose or verbose is None:
         verbose = True
     banner()
-    res = main(domain, threads, savefile, ports, silent=False, verbose=verbose, enable_bruteforce=enable_bruteforce, engines=engines)
+    res = main(domain, threads, savefile, ports, silent=False, verbose=verbose,
+            enable_bruteforce=enable_bruteforce, enable_ranges=enable_ranges,
+            engines=engines)
 
 if __name__ == "__main__":
     interactive()
